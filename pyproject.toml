@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = [ "setuptools>=61",]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "treadmill-cron"
-version = "0.1.0"
-
-[tool.setuptools]
-py-modules = ["treadmill_cron"]
+version = "1.0.0"
 
 [project.scripts]
 treadmill-cron = "treadmill_cron:main"
+
+[tool.setuptools]
+py-modules = [ "treadmill_cron",]
