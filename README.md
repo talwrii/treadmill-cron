@@ -33,6 +33,11 @@ This sets the speed to 3.0 and incline 5 for five minutes every hour.
 `treadmill-cron schedule`
 
 
+## Making this work on another treadmill
+I wrote nord-ich-track mostly with an LLM by giving it access to the open source qzdomyos project and also recording bluetooth cpatures from qzdomyos. I did this becasue I could not easily get qzdomyoos to build in a way that I could control it remotely.
+
+If your treadmill is supported by the wonderful qzdomyos you can likely do the same. qzdomyoos is wonderful, but is written in C++ and uses qt, which creates certain problems.
+
 ## LLM use
 I use an LLM to generate my config file. If you give it access to this source code it can likely do things for you.
 
