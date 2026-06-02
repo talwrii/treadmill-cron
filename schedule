@@ -1,0 +1,7 @@
+# treadmill-cron schedule
+# Formats:
+#   :MM-:MM   speed_kph  incline_pct   (minute range, repeats every hour)
+#   H:MM-H:MM speed_kph  incline_pct   (absolute time range)
+#
+:00-:05   3.0   10.0
+:30-:35   3.0   10.0
