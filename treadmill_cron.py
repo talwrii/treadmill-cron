@@ -11,6 +11,12 @@ Time ranges:
   H:MM-H:MM              absolute time of day
   day+MM:SS-day+MM:SS    MM:SS of cumulative belt time today (once/day)
 
+Keeping an axis: write the bare word `speed` or `incline` in place of a number
+  to leave that axis alone.
+  :00-:05  speed  6.0     set incline to 6%, don't touch the walking speed
+  A kept axis is never written and never restored when the entry ends, so a
+  manual adjustment mid-interval survives.
+
 Ramping (any number can take +delta/day or +delta/week):
   3.0+0.05/day           +0.05 each day since start_date
   3.5+0.1/week           +0.1/7 per day
@@ -33,10 +39,44 @@ Creep:
   other entry is running, so every interval above outranks it for free.
   interval accepts s/m/h (e.g. 10m, 600s).
 
+Modes (per-entry @mode tag):
+  @boost :00-:10  5.0  12.0    entry belongs to the 'boost' mode
+  :00-:05  3.0  10.0           no @ -> the default mode
+  Only entries whose mode matches the active mode run. The active mode lives in
+  ~/.config/treadmill-cron/mode (missing/empty = default) and is re-read every
+  tick, so `treadmill-cron mode ...` (e.g. from a MIDI remote) swaps the live
+  schedule without restarting the daemon. Switching mid-session restores the
+  walking speed and lets the new mode take over.
+
 Subcommands:
-  treadmill-cron status   show effective values for today
-  treadmill-cron hold     skip the next daily increment
-  treadmill-cron reset    zero the day counter
+  treadmill-cron status        show effective values for today
+  treadmill-cron bar           one compact line for a status bar: active mode
+                               plus the running entry's time left, or the next
+                               entry and how long until it fires
+  treadmill-cron wait [SECS]   block until that line would change (or SECS pass,
+                               default 60) so a bar can redraw on events rather
+                               than on a fixed tick:
+                                 while true; do render; treadmill-cron wait 60; done
+  treadmill-cron hold          skip the next daily increment
+  treadmill-cron reset         zero the day counter
+  treadmill-cron mode          print the active mode
+  treadmill-cron mode NAME     switch to mode NAME (e.g. boost, default)
+  treadmill-cron mode cycle    rotate to the next mode in the schedule
+  treadmill-cron now "SPEC"    run an ad-hoc sequence now, outranking all modes
+                               and entries. SPEC = 'speed incline [dur]' chunks,
+                               comma-separated; last chunk may omit dur to hold.
+                               speed/incline may be absolute (2.5), relative to
+                               press-time (+0.5, -0.2), or the keyword speed /
+                               incline (= unchanged). now also auto-restores the
+                               press-time speed & incline when the last chunk ends.
+                               e.g. now "2 2 10m, 3 2"
+                                    now "+0.5 incline 5m, -0.2 incline 2m"
+  treadmill-cron snooze DUR    suppress all scheduled firing for DUR (e.g. 30m)
+                               so manual `now` sessions aren't interrupted; `now`
+                               still works. `snooze off` cancels; bare `snooze`
+                               shows time left.
+  treadmill-cron cancel        abort the routine currently running and restore
+                               the speed/incline from before it started.
 """
 import re
 import subprocess
@@ -50,7 +90,14 @@ CONFIG_DIR = Path.home() / '.config' / 'treadmill-cron'
 SCHEDULE_FILE = CONFIG_DIR / 'schedule'
 STATE_FILE = CONFIG_DIR / 'state.json'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
+MODE_FILE = CONFIG_DIR / 'mode'
+NOW_FILE = CONFIG_DIR / 'now'
+SNOOZE_FILE = CONFIG_DIR / 'snooze'
+CANCEL_FILE = CONFIG_DIR / 'cancel'
 TICK_SECS = 2.0
+
+# Ad-hoc `now` overrides outrank every scheduled entry and every mode.
+NOW_PRIORITY = 10 ** 9
 
 DEFAULT_CONFIG = {
     'messager': [],
@@ -63,6 +110,50 @@ def load_config():
     if CONFIG_FILE.exists():
         cfg.update(json.loads(CONFIG_FILE.read_text()))
     return cfg
+
+
+# ---- mode ----
+
+def read_mode():
+    """Active mode name; missing/empty file means the default mode."""
+    try:
+        return MODE_FILE.read_text().strip() or 'default'
+    except FileNotFoundError:
+        return 'default'
+
+
+def set_mode(m):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    MODE_FILE.write_text((m or 'default') + '\n')
+
+
+def schedule_modes():
+    """Mode names that appear in the schedule, default first."""
+    try:
+        entries = parse_schedule(SCHEDULE_FILE)
+    except (FileNotFoundError, ValueError):
+        return ['default']
+    seen = ['default']
+    for e in entries:
+        m = e.get('mode', 'default')
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
+# ---- snooze ----
+
+def read_snooze_until():
+    """datetime until which scheduled firing is suppressed, or None."""
+    try:
+        return datetime.fromisoformat(SNOOZE_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def is_snoozed(now):
+    until = read_snooze_until()
+    return until is not None and now < until
 
 
 def notify(cfg, title, body):
@@ -239,6 +330,16 @@ def _parse_creep(first_parts):
     return entry
 
 
+def parse_ramp_or_keep(s, keyword):
+    """A schedule speed/incline field: a number (optionally ramped), or the bare
+    keyword ('speed'/'incline') meaning leave that axis where the walker put it.
+    'Keep' is carried as a None base all the way to the daemon, which then
+    simply doesn't send that axis -- and doesn't restore it afterwards either."""
+    if s == keyword:
+        return None, 0.0
+    return parse_ramp_number(s)
+
+
 def parse_entry(line):
     parts = line.split()
     if not parts:
@@ -246,13 +347,20 @@ def parse_entry(line):
 
     priority = None
     start_date = None
+    mode = 'default'
 
-    while parts and (parts[0].startswith('priority=') or parts[0].startswith('start=')):
+    while parts and (parts[0].startswith('priority=')
+                     or parts[0].startswith('start=')
+                     or parts[0].startswith('@')):
         tok = parts.pop(0)
         if tok.startswith('priority='):
             priority = int(tok.split('=', 1)[1])
         elif tok.startswith('start='):
             start_date = date.fromisoformat(tok.split('=', 1)[1])
+        elif tok.startswith('@'):
+            mode = tok[1:]
+            if not mode:
+                raise ValueError("@ needs a mode name, e.g. @boost")
 
     rejoined = ' '.join(parts)
     chunk_strs = [c.strip() for c in rejoined.split(',')]
@@ -262,7 +370,9 @@ def parse_entry(line):
     if len(first_parts) >= 2 and first_parts[1] == 'creep':
         if len(chunk_strs) > 1:
             raise ValueError("creep entry takes no continuations")
-        return _parse_creep(first_parts)
+        creep = _parse_creep(first_parts)
+        creep['mode'] = mode
+        return creep
 
     if len(first_parts) != 3:
         raise ValueError(f"first chunk needs 3 fields (time speed incline), got: {first_parts}")
@@ -272,13 +382,14 @@ def parse_entry(line):
     if not tr:
         raise ValueError(f"unrecognized time range: {time_range!r}")
 
-    speed_base, speed_delta = parse_ramp_number(speed_s)
-    incline_base, incline_delta = parse_ramp_number(incline_s)
+    speed_base, speed_delta = parse_ramp_or_keep(speed_s, 'speed')
+    incline_base, incline_delta = parse_ramp_or_keep(incline_s, 'incline')
 
     entry = {
         **tr,
         'priority': priority,
         'start_date': start_date,
+        'mode': mode,
         'speed_base': speed_base, 'speed_delta': speed_delta,
         'incline_base': incline_base, 'incline_delta': incline_delta,
         'continuations': [],
@@ -293,8 +404,8 @@ def parse_entry(line):
         if not m:
             raise ValueError(f"continuation time must be now-now+MM:SS, got: {ctr!r}")
         duration = parse_mm_ss(m.group(1))
-        csp_b, csp_d = parse_ramp_number(csp)
-        cinc_b, cinc_d = parse_ramp_number(cinc)
+        csp_b, csp_d = parse_ramp_or_keep(csp, 'speed')
+        cinc_b, cinc_d = parse_ramp_or_keep(cinc, 'incline')
         entry['continuations'].append({
             'duration_secs': duration,
             'speed_base': csp_b, 'speed_delta': csp_d,
@@ -323,10 +434,14 @@ def parse_schedule(path):
 # ---- effective values ----
 
 def eff_speed(e, day):
+    if e['speed_base'] is None:
+        return None
     return e['speed_base'] + e['speed_delta'] * day
 
 
 def eff_incline(e, day):
+    if e['incline_base'] is None:
+        return None
     return e['incline_base'] + e['incline_delta'] * day
 
 
@@ -360,8 +475,10 @@ def chunks_for(entry, state, first_duration_override=None):
     for c in entry.get('continuations', []):
         chunks.append({
             'duration_secs': c['duration_secs'],
-            'speed': c['speed_base'] + c['speed_delta'] * day,
-            'incline': c['incline_base'] + c['incline_delta'] * day,
+            'speed': (None if c['speed_base'] is None
+                      else c['speed_base'] + c['speed_delta'] * day),
+            'incline': (None if c['incline_base'] is None
+                        else c['incline_base'] + c['incline_delta'] * day),
         })
     return chunks
 
@@ -449,6 +566,19 @@ def _note(prev, msg):
 
 # ---- daemon ----
 
+def apply_chunk(chunk):
+    """Send a chunk's axes to the treadmill. A None axis means 'keep' -- it is
+    left exactly where the walker has it."""
+    if chunk['speed'] is not None:
+        ctl('speed', str(chunk['speed']))
+    if chunk['incline'] is not None:
+        ctl('incline', str(chunk['incline']))
+
+
+def fmt_axis(v, unit):
+    return 'keep' if v is None else f"{v:.1f}{unit}"
+
+
 def daemon():
     schedule_path = Path(sys.argv[1]) if len(sys.argv) > 1 else SCHEDULE_FILE
     print(f"treadmill-cron: watching {schedule_path}")
@@ -469,16 +599,24 @@ def daemon():
     last_announced_evt = None
     creep_accum = 0.0       # belt-time accrued toward the next creep nudge
     creep_note = None       # dedupes the "at max" log line
+    # Which axes the running entry drives; only these get restored when it ends.
+    touched_speed = True
+    touched_incline = True
 
     def stop_running(restore: bool):
+        # Restore only the axes this entry actually drove: an axis it left on
+        # 'keep' may have been adjusted by hand mid-interval, and putting it
+        # back to the pre-entry value would undo that.
         nonlocal running_entry, remaining_chunks, chunk_end_mono
         if running_entry is None:
             return
         if restore and prev_speed is not None:
             tm = get_treadmill_state()
             if is_running(tm):
-                ctl('speed', str(prev_speed))
-                ctl('incline', str(prev_incline))
+                if touched_speed:
+                    ctl('speed', str(prev_speed))
+                if touched_incline:
+                    ctl('incline', str(prev_incline))
         running_entry = None
         remaining_chunks = []
         chunk_end_mono = None
@@ -496,6 +634,18 @@ def daemon():
         update_cumulative(state, treadmill, dt)
         last_tick = now_mono
         now = datetime.now()
+        active_mode = read_mode()
+        snoozed = is_snoozed(now)
+
+        # Cancel: abort the current routine, restoring the pre-routine speed/incline.
+        if CANCEL_FILE.exists():
+            try:
+                CANCEL_FILE.unlink()
+            except FileNotFoundError:
+                pass
+            if running_entry is not None:
+                print(f"treadmill-cron: cancelled {running_entry.get('kind')}")
+                stop_running(restore=True)
 
         # Treadmill stopped while running an entry -> abort, no restore
         if running_entry and not is_running(treadmill):
@@ -504,31 +654,84 @@ def daemon():
             remaining_chunks = []
             chunk_end_mono = None
 
+        # Active mode switched away from the running entry's mode -> hand off:
+        # restore the walking speed; the new mode's entries take over below.
+        # A `now` override is mode-independent and is never aborted here.
+        if (running_entry and running_entry['kind'] != 'now'
+                and running_entry.get('mode', 'default') != active_mode):
+            print(f"treadmill-cron: mode -> {active_mode}, aborting "
+                  f"{_entry_key(running_entry)}")
+            stop_running(restore=True)
+
+        # Snooze suppresses all scheduled firing for a window; `now` still rules.
+        # If a scheduled entry is running when snooze begins, hand it back.
+        if snoozed and running_entry is not None and running_entry['kind'] != 'now':
+            print("treadmill-cron: snoozed, aborting scheduled entry")
+            stop_running(restore=True)
+
+        # Ad-hoc `now` override: consume the file and run it immediately at top
+        # priority, preempting whatever is scheduled. Waits for the belt to be
+        # moving; holds until it stops, the sequence ends, or another `now` lands.
+        if NOW_FILE.exists() and is_running(treadmill):
+            try:
+                now_chunks = json.loads(NOW_FILE.read_text()).get('chunks', [])
+            except (json.JSONDecodeError, ValueError):
+                now_chunks = []
+            try:
+                NOW_FILE.unlink()
+            except FileNotFoundError:
+                pass
+            if now_chunks:
+                if running_entry is not None:
+                    stop_running(restore=False)
+                prev_speed = treadmill.get('speed_kph', 0)
+                prev_incline = treadmill.get('incline_pct', 0)
+                # Resolve tokens (absolute / +/-delta / 'speed'|'incline' keyword)
+                # against the speed & incline at this moment.
+                remaining_chunks = [{
+                    'speed': max(0.0, round(resolve_now_value(c['speed'], prev_speed), 1)),
+                    'incline': max(0.0, round(resolve_now_value(c['incline'], prev_incline), 1)),
+                    'duration_secs': c['duration_secs'],
+                } for c in now_chunks]
+                running_entry = {'kind': 'now', 'priority': NOW_PRIORITY, 'mode': None}
+                touched_speed = touched_incline = True
+                chunk = remaining_chunks[0]
+                apply_chunk(chunk)
+                dur = chunk['duration_secs']
+                chunk_end_mono = (now_mono + dur) if dur is not None else None
+                print(f"treadmill-cron: now {fmt_axis(chunk['speed'], ' kph')} "
+                      f"{fmt_axis(chunk['incline'], '%')} "
+                      f"({'hold' if dur is None else str(dur) + 's'})")
+
         # Advance current chunk if its time is up
         if running_entry and chunk_end_mono is not None and now_mono >= chunk_end_mono:
             remaining_chunks.pop(0)
             if remaining_chunks:
                 chunk = remaining_chunks[0]
-                ctl('speed', str(chunk['speed']))
-                ctl('incline', str(chunk['incline']))
-                chunk_end_mono = now_mono + chunk['duration_secs']
-                print(f"treadmill-cron: chunk -> {chunk['speed']:.1f} kph "
-                      f"{chunk['incline']:.1f}% for {chunk['duration_secs']}s")
+                apply_chunk(chunk)
+                cdur = chunk['duration_secs']
+                chunk_end_mono = (now_mono + cdur) if cdur is not None else None
+                print(f"treadmill-cron: chunk -> {fmt_axis(chunk['speed'], ' kph')} "
+                      f"{fmt_axis(chunk['incline'], '%')} for "
+                      f"{'hold' if cdur is None else str(cdur) + 's'}")
             else:
                 if running_entry['kind'] == 'day':
                     mark_fired(state, running_entry)
                 stop_running(restore=True)
 
-        # Find best candidate to fire now
+        # Find best candidate to fire now (suppressed entirely while snoozed)
         best = None  # (priority_sort_key, entry, remaining_secs)
-        for e in entries:
-            rem = is_ready_now(e, now, state)
-            if rem is None:
-                continue
-            ep = e.get('priority')
-            key = ep if ep is not None else float('-inf')
-            if best is None or key > best[0]:
-                best = (key, e, rem)
+        if not snoozed:
+            for e in entries:
+                if e.get('mode', 'default') != active_mode:
+                    continue
+                rem = is_ready_now(e, now, state)
+                if rem is None:
+                    continue
+                ep = e.get('priority')
+                key = ep if ep is not None else float('-inf')
+                if best is None or key > best[0]:
+                    best = (key, e, rem)
 
         if best:
             _, candidate, rem = best
@@ -551,26 +754,36 @@ def daemon():
                 remaining_chunks = chunks
                 prev_speed = treadmill.get('speed_kph', 0)
                 prev_incline = treadmill.get('incline_pct', 0)
+                touched_speed = any(c['speed'] is not None for c in chunks)
+                touched_incline = any(c['incline'] is not None for c in chunks)
                 chunk = chunks[0]
-                ctl('speed', str(chunk['speed']))
-                ctl('incline', str(chunk['incline']))
+                apply_chunk(chunk)
                 chunk_end_mono = now_mono + chunk['duration_secs']
                 tag = candidate['kind']
                 print(f"treadmill-cron: start {tag} (p={cp}) "
-                      f"{chunk['speed']:.1f} kph {chunk['incline']:.1f}% "
+                      f"{fmt_axis(chunk['speed'], ' kph')} "
+                      f"{fmt_axis(chunk['incline'], '%')} "
                       f"for {chunk['duration_secs']}s "
                       f"(was {prev_speed:.1f} kph {prev_incline:.1f}%)")
                 if tag in cfg.get('notify_kinds', []):
                     notify(cfg, f"treadmill: {tag}",
-                           f"{chunk['speed']:.1f} kph {chunk['incline']:.1f}% "
+                           f"{fmt_axis(chunk['speed'], ' kph')} "
+                           f"{fmt_axis(chunk['incline'], '%')} "
                            f"for {chunk['duration_secs']}s")
                 last_announced_evt = None
 
         # Light status when idle
         if not running_entry:
-            evt = _next_announce(entries, now, state)
+            if snoozed:
+                until = read_snooze_until()
+                evt = f"snoozed until {until.strftime('%H:%M:%S')}" if until else None
+            else:
+                nxt = _next_announce(
+                    [e for e in entries if e.get('mode', 'default') == active_mode],
+                    now, state)
+                evt = f"next {nxt}" if nxt else None
             if evt and evt != last_announced_evt:
-                print(f"treadmill-cron: next {evt}")
+                print(f"treadmill-cron: {evt}")
                 last_announced_evt = evt
 
         # Creep: gentle upward pressure during free walking. Lowest priority --
@@ -580,9 +793,12 @@ def daemon():
         # measured speed, so a manual slow-down lowers where the next nudge starts.
         active_creep = next(
             (c for c in entries
-             if c['kind'] == 'creep' and creep_window_open(c['window'], now)),
+             if c['kind'] == 'creep'
+             and c.get('mode', 'default') == active_mode
+             and creep_window_open(c['window'], now)),
             None)
-        if running_entry is None and is_running(treadmill) and active_creep is not None:
+        if (running_entry is None and is_running(treadmill)
+                and active_creep is not None and not snoozed):
             creep_accum += dt
             if creep_accum >= active_creep['interval_secs']:
                 creep_accum = 0.0
@@ -627,7 +843,7 @@ def _next_announce(entries, now, state):
         else:
             label = (f"{e['kind']}(p={e.get('priority')}) at "
                      f"{cand.strftime('%H:%M:%S')} "
-                     f"{eff_speed(e, day):.2f} kph {eff_incline(e, day):.2f}%")
+                     f"{_fmt_pair(eff_speed(e, day), eff_incline(e, day))}")
         if best is None or (cand is not None and (best[0] is None or cand < best[0])):
             best = (cand, label)
     return best[1] if best else None
@@ -639,9 +855,20 @@ def fmt_secs(s):
     return f"{s//60:02d}:{s%60:02d}"
 
 
+def _fmt_pair(sp, inc):
+    """speed/incline for display; a 'keep' axis shows as `keep` not a number."""
+    sp_s = 'keep' if sp is None else f"{sp:.2f} kph"
+    inc_s = 'keep' if inc is None else f"{inc:.2f}%"
+    return f"{sp_s}  {inc_s}"
+
+
 def cmd_status():
     s = load_state()
     entries = parse_schedule(SCHEDULE_FILE)
+    print(f"active mode:       {read_mode()}  (modes: {', '.join(schedule_modes())})")
+    _su = read_snooze_until()
+    if _su and datetime.now() < _su:
+        print(f"snoozed until:     {_su.strftime('%H:%M:%S')}")
     print(f"daemon start_date: {s.get('start_date', '?')}")
     if s.get('held_count'):
         print(f"held:              {s['held_count']} day(s) skipped")
@@ -661,35 +888,39 @@ def cmd_status():
             else:
                 wstr = (f"{win['start_h']:02d}:{win['start_m']:02d}-"
                         f"{win['end_h']:02d}:{win['end_m']:02d}")
+            mstr = f"  @{e.get('mode')}" if e.get('mode', 'default') != 'default' else ''
             print(f"  creep   {wstr:<13s}    +{e['step']} kph / "
-                  f"{e['interval_secs']}s  ->  max {e['max']:.2f} kph")
+                  f"{e['interval_secs']}s  ->  max {e['max']:.2f} kph{mstr}")
             continue
         day = entry_day(e, s)
-        sp, inc = eff_speed(e, day), eff_incline(e, day)
+        vals = _fmt_pair(eff_speed(e, day), eff_incline(e, day))
         prio = e.get('priority')
         prio_str = f"p={prio}" if prio is not None else "p=-"
         sd = e.get('start_date')
         sd_str = f" since {sd} (day {day})" if sd else ""
         if e['kind'] == 'hourly':
             base = (f"  hourly  :{fmt_secs(e['start_secs'])}-:{fmt_secs(e['end_secs'])}    "
-                    f"{sp:.2f} kph  {inc:.2f}%")
+                    f"{vals}")
         elif e['kind'] == 'absolute':
             base = (f"  abs     {e['start_h']:02d}:{e['start_m']:02d}-"
-                    f"{e['end_h']:02d}:{e['end_m']:02d}    {sp:.2f} kph  {inc:.2f}%")
+                    f"{e['end_h']:02d}:{e['end_m']:02d}    {vals}")
         elif e['kind'] == 'day':
             end_off = eff_end_offset(e, day)
             dur = end_off - e['start_offset']
             fired = ' [fired today]' if fired_today(s, e) else ''
             base = (f"  day     day+{fmt_secs(e['start_offset'])}-day+{fmt_secs(end_off)}    "
-                    f"({dur}s)    {sp:.2f} kph  {inc:.2f}%{fired}")
+                    f"({dur}s)    {vals}{fired}")
         else:
             continue
         cont_str = ''
         for c in e.get('continuations', []):
-            cs = c['speed_base'] + c['speed_delta'] * day
-            ci = c['incline_base'] + c['incline_delta'] * day
-            cont_str += f", +{c['duration_secs']}s @ {cs:.2f} kph {ci:.2f}%"
-        print(f"{base}    [{prio_str}{sd_str}]{cont_str}")
+            cs = (None if c['speed_base'] is None
+                  else c['speed_base'] + c['speed_delta'] * day)
+            ci = (None if c['incline_base'] is None
+                  else c['incline_base'] + c['incline_delta'] * day)
+            cont_str += f", +{c['duration_secs']}s @ {_fmt_pair(cs, ci)}"
+        mode_str = f"@{e.get('mode')} " if e.get('mode', 'default') != 'default' else ''
+        print(f"{base}    [{mode_str}{prio_str}{sd_str}]{cont_str}")
 
 
 def cmd_hold():
@@ -710,9 +941,229 @@ def cmd_reset():
     print("treadmill-cron: reset. day = 0, cumulative cleared")
 
 
+def cmd_mode(arg=None):
+    if arg is None:
+        print(read_mode())
+        return
+    known = schedule_modes()
+    if arg == 'cycle':
+        cur = read_mode()
+        i = known.index(cur) if cur in known else 0
+        arg = known[(i + 1) % len(known)]
+    set_mode(arg)
+    if arg not in known:
+        print(f"treadmill-cron: warning: nothing tagged '@{arg}' in schedule "
+              f"(known: {', '.join(known)})", file=sys.stderr)
+    notify(load_config(), "treadmill mode", arg)
+    print(arg)
+
+
+def _fmt_short(secs):
+    """Compact duration for the status bar: 45s, 7m, 1h04m."""
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def _fmt_pair_short(e, state):
+    """Entry's speed/incline, narrow enough for a status bar. A 'keep' axis is
+    simply omitted, so an incline-only entry reads as just `6%`."""
+    day = entry_day(e, state)
+    sp, inc = eff_speed(e, day), eff_incline(e, day)
+    bits = []
+    if sp is not None:
+        bits.append(f"{sp:.1f}k")
+    if inc is not None:
+        bits.append(f"{inc:.0f}%")
+    return '/'.join(bits) if bits else '-'
+
+
+def _secs_until(e, now):
+    """Seconds until this entry's window next opens, or None if not clock-based."""
+    if e['kind'] == 'hourly':
+        cur = now.minute * 60 + now.second
+        return (e['start_secs'] - cur) % 3600
+    if e['kind'] == 'absolute':
+        cur = now.hour * 3600 + now.minute * 60 + now.second
+        start = e['start_h'] * 3600 + e['start_m'] * 60
+        return (start - cur) % 86400
+    return None
+
+
+def bar_line():
+    """One compact status-bar line: active mode + what happens next.
+
+    Schedule-derived only -- it does not talk to the daemon, so it reports what
+    *should* be happening. Returns None if the schedule is unreadable.
+    """
+    try:
+        entries = parse_schedule(SCHEDULE_FILE)
+    except (FileNotFoundError, ValueError):
+        return None
+    mode = read_mode()
+    now = datetime.now()
+    state = load_state()
+
+    su = read_snooze_until()
+    if su and now < su:
+        return f"tread {mode} snooze {_fmt_short((su - now).total_seconds())}"
+
+    mine = [e for e in entries
+            if e.get('mode', 'default') == mode and e['kind'] != 'creep']
+
+    # Something already inside its window wins -- show how long it has left.
+    open_now = [(rem, e) for e in mine
+                for rem in [is_ready_now(e, now, state)] if rem is not None]
+    if open_now:
+        rem, e = min(open_now, key=lambda t: t[0])
+        return f"tread {mode} {_fmt_pair_short(e, state)} {_fmt_short(rem)} left"
+
+    upcoming = [(w, e) for e in mine
+                for w in [_secs_until(e, now)] if w is not None]
+    if upcoming:
+        wait, e = min(upcoming, key=lambda t: t[0])
+        return f"tread {mode} {_fmt_pair_short(e, state)} in {_fmt_short(wait)}"
+
+    return f"tread {mode} idle"
+
+
+def cmd_bar():
+    line = bar_line()
+    if line is not None:
+        print(line)
+
+
+def cmd_wait(timeout_s=60.0):
+    """Block until the `bar` line would read differently, or until timeout.
+
+    Lets a status bar redraw on treadmill events (a window opening or closing,
+    a mode switch, a snooze) instead of on a fixed tick, while the timeout keeps
+    the bar's other fields -- clock, wifi, music -- refreshing as before.
+    Cheap to poll: this reads files only, it never queries the treadmill.
+    """
+    start = bar_line()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        if bar_line() != start:
+            return
+
+
+def _check_now_token(tok, keyword):
+    """A now speed/incline token: a number (absolute), +/-N (relative to the
+    value at press-time), or the keyword itself (= unchanged)."""
+    if tok == keyword:
+        return
+    if re.fullmatch(r'[+-]?\d+(?:\.\d+)?', tok):
+        return
+    raise ValueError(f"bad {keyword} value {tok!r}: use a number, +/-delta, or '{keyword}'")
+
+
+def resolve_now_value(token, base):
+    """Resolve a now token against the press-time base value.
+    number -> absolute; '+0.5'/'-0.2' -> base+delta; 'speed'/'incline' -> base."""
+    if isinstance(token, (int, float)):
+        return float(token)
+    t = str(token)
+    if t in ('speed', 'incline'):
+        return float(base)
+    if t[0] in '+-':
+        return float(base) + float(t)
+    return float(t)
+
+
+def parse_now_spec(spec):
+    """'2 2 10m, +0.5 incline 3m, speed incline' -> chunk dicts. Tokens are kept
+    raw; relative '+/-' and the 'speed'/'incline' keywords resolve at press-time
+    in the daemon. Only the last chunk may omit duration."""
+    parts = [c.strip() for c in spec.split(',') if c.strip()]
+    if not parts:
+        raise ValueError("empty now spec")
+    chunks = []
+    for i, p in enumerate(parts):
+        toks = p.split()
+        if len(toks) not in (2, 3):
+            raise ValueError(f"chunk needs 'speed incline [duration]': {p!r}")
+        _check_now_token(toks[0], 'speed')
+        _check_now_token(toks[1], 'incline')
+        if len(toks) == 3:
+            dur = parse_duration(toks[2])
+        elif i != len(parts) - 1:
+            raise ValueError(f"only the last chunk may omit duration: {p!r}")
+        else:
+            dur = None
+        chunks.append({'speed': toks[0], 'incline': toks[1], 'duration_secs': dur})
+    return chunks
+
+
+def _fmt_now(chunks):
+    return ' -> '.join(
+        f"{c['speed']}/{c['incline']}"
+        + (' hold' if c['duration_secs'] is None else f" {c['duration_secs']}s")
+        for c in chunks)
+
+
+def cmd_now(spec):
+    chunks = parse_now_spec(spec)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    NOW_FILE.write_text(json.dumps({'chunks': chunks}))
+    desc = _fmt_now(chunks)
+    notify(load_config(), "treadmill now", desc)
+    print(f"treadmill-cron: queued now: {desc}")
+
+
+def cmd_snooze(arg=None):
+    if arg is None:
+        until = read_snooze_until()
+        now = datetime.now()
+        if until and now < until:
+            rem = int((until - now).total_seconds())
+            print(f"snoozed {rem // 60}m {rem % 60}s left "
+                  f"(until {until.strftime('%H:%M:%S')})")
+        else:
+            print("not snoozed")
+        return
+    if arg in ('off', '0', 'none', 'cancel'):
+        try:
+            SNOOZE_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        notify(load_config(), "treadmill snooze", "off")
+        print("snooze cleared")
+        return
+    secs = parse_duration(arg)
+    until = datetime.now() + timedelta(seconds=secs)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SNOOZE_FILE.write_text(until.isoformat())
+    notify(load_config(), "treadmill snooze", f"{secs // 60}m")
+    print(f"treadmill-cron: snoozed for {secs // 60}m {secs % 60}s "
+          f"(schedule suppressed until {until.strftime('%H:%M:%S')})")
+
+
+def cmd_cancel():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CANCEL_FILE.write_text('1')
+    notify(load_config(), "treadmill", "cancel")
+    print("treadmill-cron: cancel requested")
+
+
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] in ('status', 'hold', 'reset'):
-        return {'status': cmd_status, 'hold': cmd_hold, 'reset': cmd_reset}[sys.argv[1]]()
+    if len(sys.argv) >= 2 and sys.argv[1] in ('status', 'hold', 'reset', 'bar'):
+        return {'status': cmd_status, 'hold': cmd_hold, 'reset': cmd_reset,
+                'bar': cmd_bar}[sys.argv[1]]()
+    if len(sys.argv) >= 2 and sys.argv[1] == 'wait':
+        return cmd_wait(float(sys.argv[2]) if len(sys.argv) >= 3 else 60.0)
+    if len(sys.argv) >= 2 and sys.argv[1] == 'mode':
+        return cmd_mode(sys.argv[2] if len(sys.argv) >= 3 else None)
+    if len(sys.argv) >= 2 and sys.argv[1] == 'now':
+        return cmd_now(' '.join(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == 'snooze':
+        return cmd_snooze(sys.argv[2] if len(sys.argv) >= 3 else None)
+    if len(sys.argv) >= 2 and sys.argv[1] == 'cancel':
+        return cmd_cancel()
     daemon()
 
 
