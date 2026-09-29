@@ -8,7 +8,7 @@ This only works with the nordictrack 6.5s treadmill at the moment via nord-ich-t
 AI-generated an unreviewed code.
 
 ## Motivation
-Treadmill desks are great. You often want to just walk while your treadmill runs rather than messing with settings.  I plot along at 1.4 -2.0 kph for hours at an end.  Treadmill cron allows you to automate some intervals or variation through your day to get you some free exercise. 
+Treadmill desks are great. You often want to just walk while your treadmill runs rather than messing with settings.  I plod along at 1.4 -2.0 kph for hours at an end.  Treadmill cron allows you to automate some intervals or variation through your day to get you some free exercise. 
 
 Intense exercise has certain health benefits including hormonal effects which reduce visceral fat so make a good addition to low intensity exercise.
 
@@ -19,23 +19,28 @@ Intense exercise has certain health benefits including hormonal effects which re
 * Interactively run a routine when you want it in response to a button being pressed (see "speed play")
 
 ## Installatation
+
+```
 pipx install nord-ich-track
 pipx install treadmill-cron
+```
 
 ## Usage
-Start nord-ich-track in daemon mode. 
+Start nord-ich-track in daemon mode with `nord-ick-track daemon`
 
-Generate a schedule file then run:
+Create a schedule file, `treadmill.schedule`. This sets the speed to 3.0 and incline 5 for five minutes every hour.
 
 ```
 :00-:05  3.0  5.0
 ```
 
-This sets the speed to 3.0 and incline 5 for five minutes every hour.
+You can then run, `treadmill-cron treadmill.schedule` to run this rountine.
 
-`treadmill-cron schedule`
+To overwrite this setting you can use `treadmill-cron now`.
 
-To run a routine now, overriding the schedule you can use `treadmill-cron now`
+treadmill-cron supports modes. Entries labelled with a mode only run when in this model.
+
+`treadmill-cron events` output events when blocks start and stop. You can use this to trigger actions such as stopping or playiong music or starting a fan.
 
 
 ## Making this work on another treadmill
@@ -44,5 +49,5 @@ I wrote nord-ich-track mostly with an LLM by giving it access to the open source
 If your treadmill is supported by the wonderful qzdomyos you can likely do the same. qzdomyoos is wonderful, but is written in C++ and uses qt, which creates certain problems.
 
 ## LLM use
-I use an LLM to generate my config file. If you give it access to this source code it can likely do things for you.
+I use an LLM to generate my config file. If you give youe `llm` access to this source code it can likely do things for you.
 
