@@ -1,7 +1,9 @@
 # treadmill cron
-Vary your walking speed and incline on your treadmill desk.
+Vary walking speed and incline on your treadmill desk (r/musicalTreadmillDesk)
 
-Only works with the nordictrack 6.5s treadmill at the moment. If you can code *a little* you may be able to adapt it ot your treadmill.
+Also provides interactive features rout routines.
+
+This only works with the nordictrack 6.5s treadmill at the moment via nord-ich-track. If you can code *a little* you may be able to adapt treadmill-cron to your treadmill.
 
 AI-generated an unreviewed code.
 
@@ -12,7 +14,9 @@ Intense exercise has certain health benefits including hormonal effects which re
 
 ## Features
 * Increase speed at certain times during the day or every hour
+* Have different types of day (such as an endurance, speed and recovery days)
 * Have the speed "creep up" for other times of the day. This is useful if you get tired.
+* Interactively run a routine when you want it in response to a button being pressed (see "speed play")
 
 ## Installatation
 pipx install nord-ich-track
@@ -29,8 +33,9 @@ Generate a schedule file then run:
 
 This sets the speed to 3.0 and incline 5 for five minutes every hour.
 
-
 `treadmill-cron schedule`
+
+To run a routine now, overriding the schedule you can use `treadmill-cron now`
 
 
 ## Making this work on another treadmill
